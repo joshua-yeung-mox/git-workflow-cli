@@ -354,3 +354,53 @@ A: Update symlinks in copilot-workspace to point to this new repo location.
 
 **Q: Why Python 3.12 and uv?**
 A: Python 3.12 is current stable with great performance. `uv` is faster and more reliable than pip for dependency management.
+
+---
+
+## 📦 Consolidation: commit-cli
+
+As of 2026-05-05, the `commit-cli` repository has been consolidated into `git-workflow-cli`.
+
+### What Changed
+
+- ✅ `lib/commit_cli/` — Core formatting logic from commit-cli
+- ✅ `/github commit-check` — Replaces `commit-cli check`
+- ✅ `/github commit-format` — Replaces `commit-cli format`
+- ✅ `/github fix-commit` — Now uses commit_cli.formatter
+- ✅ `/github validate-commit` — Now uses commit_cli.formatter
+
+### For Users
+
+Use `/github` skill instead of `commit-cli`:
+
+```bash
+# Old way (commit-cli, deprecated)
+commit-cli check
+commit-cli format
+
+# New way (git-workflow-cli, recommended)
+/github commit-check
+/github commit-format
+```
+
+### For Developers
+
+The `lib/commit_cli/` module is now part of git-workflow-cli:
+
+```python
+from commit_cli.formatter import format_message, check_message
+
+# Format a message
+formatted = format_message("Long message here")
+
+# Check for violations
+violations = check_message(msg)
+```
+
+All commit-related operations share this single module for consistency.
+
+### Deprecated Repo
+
+The `commit-cli` repository at `~/PycharmProjects/commit-cli/` is deprecated.
+See DEPRECATED.md in that repo for migration details.
+
