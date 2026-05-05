@@ -61,7 +61,40 @@ Remove files from remote while keeping them locally.
 /github pr-remove-files
 ```
 
-### Commit Message Management
+### Commit Message Management (Integrated from commit-cli)
+
+#### `commit-check`
+Scan commits and report messages with lines > 70 characters.
+
+```bash
+/github commit-check                    # Scan commits not in base branch
+/github commit-check --refs HEAD~10     # Scan specific range
+```
+
+Options:
+- `--refs <revspec>` — Git revision spec to scan (default: base..HEAD where base is origin/main, origin/master, etc.)
+
+Example output:
+```
+Scanning commits in: origin/main..HEAD
+abc1234 "Add new feature to system"
+  subject line 1: len=85
+    This is a really long subject line that exceeds seventy characters
+  body line 5: len=92
+    This is some body text that is also too long and needs to be wrapped properly
+```
+
+#### `commit-format`
+Format a commit message from stdin to 70-character width.
+
+```bash
+echo "This is a very long commit message that needs to be wrapped" | /github commit-format
+```
+
+Behavior:
+- Wraps subject and body lines to 70 characters
+- Preserves paragraph structure (blank lines between paragraphs)
+- Preserves trailing trailers (Co-authored-by, etc.)
 
 #### `fix-commit`
 Check or fix commit message formatting to 70-character width.
