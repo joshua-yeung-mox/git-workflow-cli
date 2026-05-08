@@ -1,18 +1,36 @@
 #!/usr/bin/env python3
-"""Scan commits and report messages with lines > 70 chars.
-
-Extracted from commit-cli for integration into /github skill.
-"""
+"""Scan commits and report messages with lines > 70 chars."""
 
 import subprocess
 import sys
 from typing import Optional
-from pathlib import Path
 
-# Add lib to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "lib"))
+WIDTH = 70
 
-from commit_cli.formatter import check_message
+
+def _normalize_newlines(s: str) -> str:
+    return s.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def check_message(msg: str) -> list[tuple[str, int, int, str]]:
+    """Return list of violations: (type, lineno, length, line_text)
+    
+    type is 'subject' or 'body'
+    """
+    msg = _normalize_newlines(msg)
+    lines = msg.splitlines()
+    i = 0
+    while i < len(lines) and lines[i].strip() == "":
+        i += 1
+    violations: list[tuple[str, int, int, str]] = []
+    if i < len(lines):
+        subject = lines[i]
+        if len(subject) > WIDTH:
+            violations.append(("subject", i + 1, len(subject), subject))
+    for idx, line in enumerate(lines[i + 1 :], start=i + 2):
+        if len(line) > WIDTH:
+            violations.append(("body", idx, len(line), line))
+    return violations
 
 
 def _git_verify(ref: str) -> bool:

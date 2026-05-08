@@ -128,16 +128,73 @@ Validate commit message format (used by pre-commit hooks).
 git log -n1 --format=%B | /github validate-commit --check
 ```
 
-### Helpers
+### Push Operations (Zscaler Bypass)
 
 #### `gh-api`
-Direct GitHub API push helper.
+**Push via GitHub REST API — bypasses Zscaler on every push.**
+
+Use this for ALL git pushes. Zscaler blocks `git push` (HTTPS binary pack
+format) and SSH. This command uses JSON-only GitHub API calls that Zscaler
+permits.
+
+**Handles all scenarios automatically:**
+- Regular incremental push (most common)
+- Missing/gone local tracking ref — queries GitHub API for remote SHA, no `git fetch` needed
+- Diverged remote (e.g. auto-init commit not in local history) — switches to full-file upload mode
+- Brand-new empty repo — creates the branch ref from scratch
+- Transient connection resets — retries up to 3× automatically
 
 ```bash
-/github gh-api [args]
+/github gh-api              # Standard push
+/github gh-api --force      # Force push (diverged history, rebase, squash)
 ```
 
-## Examples
+**Scenario 1 — Regular push (most common):**
+```bash
+git add . && git commit -m "feat: Add feature"
+/github gh-api
+# ── GitHub Git Data API push ──
+# Repo:   owner/repo   Branch: main   Pushing 2 commit(s)
+# ✅ main → a1b2c3d
+```
+
+**Scenario 2 — Brand-new repo:**
+```bash
+gh repo create owner/new-repo --private          # no --auto-init needed
+git remote add origin https://github.com/owner/new-repo.git
+git add . && git commit -m "feat: Initial commit"
+/github gh-api    # auto-bootstraps the empty repo, then pushes all files
+```
+
+Note: GitHub's Git Data API returns 409 on repos with no commits yet. The
+script detects this and automatically creates a bootstrap commit (via the
+Contents API) before pushing your actual content. Only two commits will
+appear in history: the bootstrap placeholder and your real commit.
+
+**Scenario 3 — Tracking ref "gone" (repo recreated, no fetch yet):**
+```bash
+# git branch -vv shows: * main abc1234 [origin/main: gone]
+/github gh-api    # auto-detects remote SHA via API — no manual fix needed
+```
+
+**After push, sync local tracking ref:**
+```bash
+git fetch && git reset --hard origin/main
+```
+
+**Push after committing (replaces git push):**
+```bash
+git add . && git commit -m "fix: Update logic"
+/github gh-api
+```
+
+**New repo — first push:**
+```bash
+gh repo create owner/repo --private    # no --auto-init needed
+git remote add origin https://github.com/owner/repo.git
+git add . && git commit -m "feat: Initial commit"
+/github gh-api    # bootstraps empty repo automatically, then pushes
+```
 
 **Setup a new PR with reviewers:**
 ```bash
