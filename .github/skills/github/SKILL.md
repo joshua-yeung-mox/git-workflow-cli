@@ -177,10 +177,8 @@ appear in history: the bootstrap placeholder and your real commit.
 /github gh-api    # auto-detects remote SHA via API — no manual fix needed
 ```
 
-**After push, sync local tracking ref:**
-```bash
-git fetch && git reset --hard origin/main
-```
+**After push, local HEAD is auto-synced** via HTTPS (no SSH needed). If sync
+fails for any reason, the script prints the manual command to run.
 
 **Push after committing (replaces git push):**
 ```bash

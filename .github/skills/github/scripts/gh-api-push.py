@@ -34,7 +34,9 @@ How it works:
     5. Builds a new tree and commit via API
     6. Updates (or creates) the remote branch ref, with retry on transient
        connection resets
-    7. Prints a git command to sync local to the new remote SHA
+    7. Auto-syncs local HEAD: fetches the new commit object via HTTPS using
+       'gh auth git-credential' (bypasses Zscaler SSH block) and resets
+       local HEAD to match — no manual 'git fetch' step needed
 """
 
 import base64
@@ -325,8 +327,62 @@ def main():
         )
     print(f"  ✅ {branch} → {new_commit['sha'][:7]}")
 
-    print(f"\nDone! To sync local HEAD to the new remote SHA:")
-    print(f"  git fetch && git reset --hard origin/{branch}")
+    auto_sync(repo_slug, branch, new_commit["sha"], repo_root)
+
+
+def auto_sync(repo_slug: str, branch: str, new_sha: str, repo_root: Path):
+    """Sync local tracking ref after an API push without requiring SSH.
+
+    The API push creates a new git commit object on GitHub that doesn't exist
+    locally, so 'git branch -vv' would show the branch as ahead forever and
+    'git status' would warn about diverged history.
+
+    SSH fetch is blocked by Zscaler. This uses 'gh auth git-credential' as a
+    credential helper so git can fetch via HTTPS without exposing a token.
+
+    Steps:
+      1. Ensure the remote is configured as HTTPS (credential helper needs it)
+      2. Set branch tracking config
+      3. git fetch via HTTPS + gh credential helper → downloads new commit object
+      4. git reset --hard to make local HEAD SHA match remote SHA
+    """
+    print("\nSyncing local HEAD...")
+
+    # 1. Ensure origin uses HTTPS (credential helper only works with HTTPS)
+    remote_url_r = run(["git", "remote", "get-url", "origin"], cwd=repo_root, check=False)
+    if remote_url_r.returncode == 0:
+        url = remote_url_r.stdout.decode().strip()
+        if url.startswith("git@github.com:"):
+            https_url = f"https://github.com/{repo_slug}.git"
+            run(["git", "remote", "set-url", "origin", https_url], cwd=repo_root, check=False)
+            print(f"  Remote URL updated to HTTPS")
+
+    # 2. Set tracking config so 'git status' knows the upstream
+    run(["git", "config", f"branch.{branch}.remote", "origin"], cwd=repo_root, check=False)
+    run(["git", "config", f"branch.{branch}.merge", f"refs/heads/{branch}"], cwd=repo_root, check=False)
+
+    # 3. Fetch new commit object via HTTPS (bypasses SSH / Zscaler)
+    fetch_r = run(
+        ["git", "-c", "credential.helper=!gh auth git-credential",
+         "fetch", "origin", f"refs/heads/{branch}:refs/remotes/origin/{branch}"],
+        cwd=repo_root, check=False,
+    )
+    if fetch_r.returncode != 0:
+        print(f"  ⚠ Auto-sync fetch failed — run manually:")
+        print(f"    git -c credential.helper='!gh auth git-credential' fetch origin")
+        print(f"    git reset --hard origin/{branch}")
+        return
+
+    # 4. Reset local HEAD to the fetched remote SHA
+    reset_r = run(["git", "reset", "--hard", f"refs/remotes/origin/{branch}"],
+                  cwd=repo_root, check=False)
+    synced = git_str("rev-parse", "HEAD", cwd=repo_root)
+    if reset_r.returncode == 0:
+        print(f"  ✅ Local HEAD → {synced[:7]}  (matches remote)")
+    else:
+        # Tracking ref updated even if working tree reset had issues (e.g. long symlinks)
+        print(f"  ✅ Tracking ref synced → {new_sha[:7]}")
+        print(f"     (working tree unchanged — run 'git reset --hard origin/{branch}' if needed)")
 
 
 if __name__ == "__main__":
