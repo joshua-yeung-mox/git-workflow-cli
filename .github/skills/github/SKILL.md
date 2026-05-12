@@ -1,12 +1,21 @@
 ---
 name: github
-description: Consolidated GitHub workflow helpers for pull request management and commit message formatting.
+description: Git guidance and GitHub automation — branch workflows, conflict resolution, PR management, commit formatting, and Zscaler-safe push via GitHub API.
 allowed-tools: []
 ---
 
 # GitHub Skill
 
-Consolidated GitHub workflow helpers for pull request management and commit message formatting.
+Git guidance and GitHub automation in one skill. Use `/github` for everything Git/GitHub related:
+- **Git guidance:** branch workflows, resolving conflicts, composing commit messages
+- **GitHub automation:** PR management, commit formatting, Zscaler-safe push
+
+When running commands, operate from the repository root. Confirm before executing any destructive commands (force-push, reset, clean).
+
+**Git guidance examples:**
+- "Fix my merge conflict on branch X"
+- "Suggest git commands to squash commits"
+- "How should I rebase my work onto main?"
 
 ## Subcommands
 

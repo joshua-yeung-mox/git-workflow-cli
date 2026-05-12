@@ -166,7 +166,20 @@ def create_blob(repo_slug, file_path: str, repo_root: Path) -> str | None:
     full_path = repo_root / file_path
     if full_path.is_dir():
         return None
-    content = full_path.read_bytes()
+
+    # Read from git objects first — handles deleted files and broken symlinks.
+    # git cat-file blob HEAD:<path> returns the committed content regardless of
+    # whether the working-tree file exists or is a symlink to a missing target.
+    result = run(["git", "cat-file", "blob", f"HEAD:{file_path}"], cwd=repo_root, check=False)
+    if result.returncode == 0:
+        content = result.stdout
+    elif full_path.exists() and not full_path.is_symlink():
+        # Newly staged file not yet fully committed (edge case)
+        content = full_path.read_bytes()
+    else:
+        print(f"  (skipped — not in git objects and not on disk: {file_path})")
+        return None
+
     resp = gh_api(
         repo_slug,
         "git/blobs",
