@@ -6,6 +6,18 @@ allowed-tools: []
 
 # GitHub Skill
 
+## Agent usage (important)
+
+- Use the skill via the local command name `github` (no leading slash). Do NOT call `/github` — absolute `/github` was the source of PATH failures for some agents.
+- Prefer invoking the skill through the assistant skill API (functions.skill with skill="github") when automating; this runs the skill in the correct context and avoids PATH/permission issues.
+- For Zscaler-safe pushes use `github gh-api` or the `gh-api` shim (installed at `~/.local/bin/gh-api`). If an agent's environment doesn't include `~/.local/bin`, install a system shim (e.g. `/usr/local/bin/gh-api`) or update PATH.
+- PR creation guidance:
+  - `github pr-create` auto-detects the repo default branch and uses repository PR templates (case-insensitive).
+  - Use `--edit` to open the template (or provided body file) in the editor for modification before creating the PR.
+  - Inline `--body` is merged into templates if provided; use `--body-file` for non-interactive flows.
+- When scripting, ensure `gh` is authenticated (`gh auth status`) or inject a token via `credentials-cli` to avoid interactive auth prompts.
+
+
 Git guidance and GitHub automation in one skill. Use `/github` for everything Git/GitHub related:
 - **Git guidance:** branch workflows, resolving conflicts, composing commit messages
 - **GitHub automation:** PR management, commit formatting, Zscaler-safe push

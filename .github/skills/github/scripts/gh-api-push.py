@@ -333,11 +333,25 @@ def main():
             cwd=repo_root,
         )
     else:
-        gh_api(
-            repo_slug, f"git/refs/heads/{branch}", method="PATCH",
-            data={"sha": new_commit["sha"], "force": True},
-            cwd=repo_root,
+        # Try PATCH first; fall back to POST if the ref doesn't exist on GitHub
+        # (can happen when local tracking config exists but branch was never pushed)
+        cmd = ["gh", "api", f"repos/{repo_slug}/git/refs/heads/{branch}",
+               "-X", "PATCH", "--input", "-"]
+        patch_r = subprocess.run(
+            cmd, input=json.dumps({"sha": new_commit["sha"], "force": True}).encode(),
+            capture_output=True, cwd=str(repo_root),
         )
+        if patch_r.returncode != 0 and "Reference does not exist" in patch_r.stderr.decode():
+            print("  Branch ref missing on remote — creating via POST...")
+            gh_api(
+                repo_slug, "git/refs", method="POST",
+                data={"ref": f"refs/heads/{branch}", "sha": new_commit["sha"]},
+                cwd=repo_root,
+            )
+        elif patch_r.returncode != 0:
+            print(f"ERROR: {' '.join(cmd)}", file=sys.stderr)
+            print(patch_r.stderr.decode()[:500], file=sys.stderr)
+            sys.exit(1)
     print(f"  ✅ {branch} → {new_commit['sha'][:7]}")
 
     auto_sync(repo_slug, branch, new_commit["sha"], repo_root)
