@@ -82,6 +82,40 @@ Remove files from remote while keeping them locally.
 /github pr-remove-files
 ```
 
+#### `pr-watch`
+Watch a PR's CI / review / merge state in the foreground and exit on a terminal state.
+
+```bash
+/github pr-watch                 # watch the current branch's PR
+/github pr-watch 3484            # watch a specific PR
+/github pr-watch 3484 --once     # single status check, then exit
+```
+
+Options:
+- `--interval N` — poll interval in seconds (default 15)
+- `--diagnose` — on CI failure, run `ci-debug analyze` and print the root cause
+- `--exit-on-approved` — exit 0 as soon as the PR is approved (before merge)
+- `--once` — single poll, print status, exit (for scripting / manual checks)
+- `--json` — emit the status block as JSON (verdict goes to stderr)
+
+Exit codes:
+
+| Code | Meaning |
+|------|---------|
+| `0` | merged (or approved with `--exit-on-approved`); with `--once`, a nonterminal snapshot |
+| `1` | closed without merge |
+| `2` | CI failing |
+| `3` | no PR found for the branch (or invalid PR number) |
+| `4` | `gh` not authenticated |
+| `5` | operational failure (e.g. `gh` network error after retries) |
+| `130` | interrupted (Ctrl-C) |
+
+Example — watch until merge, then push any follow-up:
+
+```bash
+/github pr-watch 3484 && /github gh-api
+```
+
 ### Commit Message Management (Integrated from commit-cli)
 
 #### `commit-check`

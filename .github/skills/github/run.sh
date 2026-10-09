@@ -16,6 +16,7 @@ GitHub PR Operations:
    /github pr-complete        Complete PR workflow
    /github pr-add-reviewers   Add team reviewers to PR
    /github pr-remove-files    Remove files from remote (keep local)
+   /github pr-watch           Watch a PR (CI/review/merge), exit on terminal state
 
 Commit Message Management (Integrated from commit-cli):
    /github commit-check       Scan commits for lines > 70 chars
@@ -69,6 +70,9 @@ case "$SUBCOMMAND" in
     ;;
   pr-remove-files)
     exec "$SCRIPTS_DIR/pr-remove-files-from-remote.sh" "$@"
+    ;;
+  pr-watch)
+    exec python3 "$SCRIPTS_DIR/pr_watch.py" "$@"
     ;;
   commit-check)
     exec python3 "$SCRIPTS_DIR/commit_check.py" "$@"
