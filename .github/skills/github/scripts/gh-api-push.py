@@ -48,9 +48,7 @@ from pathlib import Path
 
 
 def run(cmd, cwd, input_data=None, check=True):
-    result = subprocess.run(
-        cmd, input=input_data, capture_output=True, cwd=str(cwd)
-    )
+    result = subprocess.run(cmd, input=input_data, capture_output=True, cwd=str(cwd))
     if check and result.returncode != 0:
         print(f"ERROR: {' '.join(str(c) for c in cmd)}", file=sys.stderr)
         print(result.stderr.decode()[:500], file=sys.stderr)
@@ -70,8 +68,12 @@ def object_exists_locally(sha: str, repo_root: Path) -> bool:
 def detect_context(repo_root: Path):
     """Auto-detect repo slug, branch, and remote SHA.
 
-    Returns (slug, branch, remote_sha) where remote_sha is None when the
-    remote branch does not exist yet (brand-new empty repo).
+    Returns (slug, branch, remote_sha, is_new_branch) where:
+      - remote_sha is None only for a brand-new empty repo (needs bootstrap)
+      - remote_sha is "" for a new branch on an existing repo whose base commit
+        is not available locally (full upload, but NO bootstrap)
+      - is_new_branch is True when the branch does not yet exist on the remote
+        (ref must be created via POST, not PATCHed)
 
     Falls back to the GitHub API when the local tracking ref is missing or
     marked "gone" — no git fetch required.
@@ -88,31 +90,71 @@ def detect_context(repo_root: Path):
     # Try local tracking ref first (fast path — no network call)
     tracking_r = run(
         ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
-        cwd=repo_root, check=False,
+        cwd=repo_root,
+        check=False,
     )
     if tracking_r.returncode == 0:
         tracking = tracking_r.stdout.decode().strip()
         sha_r = run(["git", "rev-parse", tracking], cwd=repo_root, check=False)
         if sha_r.returncode == 0:
-            return slug, branch, sha_r.stdout.decode().strip()
+            return slug, branch, sha_r.stdout.decode().strip(), False
 
     # Tracking ref missing or "gone" — ask GitHub API directly
     print(f"  Local tracking ref missing — querying GitHub API for {branch}...")
     api_r = run(
         ["gh", "api", f"repos/{slug}/git/refs/heads/{branch}", "--jq", ".object.sha"],
-        cwd=repo_root, check=False,
+        cwd=repo_root,
+        check=False,
     )
     if api_r.returncode == 0 and api_r.stdout.strip():
         remote_sha = api_r.stdout.decode().strip()
         # Persist tracking config so git branch -vv shows correct status
         run(["git", "config", f"branch.{branch}.remote", "origin"], cwd=repo_root, check=False)
-        run(["git", "config", f"branch.{branch}.merge", f"refs/heads/{branch}"], cwd=repo_root, check=False)
+        run(
+            ["git", "config", f"branch.{branch}.merge", f"refs/heads/{branch}"],
+            cwd=repo_root,
+            check=False,
+        )
         print(f"  Remote {branch}: {remote_sha[:7]}")
-        return slug, branch, remote_sha
+        return slug, branch, remote_sha, False
 
-    # No remote branch at all — new empty repo
+    # No remote branch at all — either a new branch on an existing repo, or a
+    # brand-new empty repo. Distinguish by checking whether ANY ref exists.
+    any_ref = run(
+        ["gh", "api", f"repos/{slug}/git/refs", "--jq", ".[0].object.sha"],
+        cwd=repo_root,
+        check=False,
+    )
+    if any_ref.returncode == 0 and any_ref.stdout.strip():
+        # Repo is NOT empty — this is a new branch. Diff against the default
+        # branch's tree so we only upload new/changed files (not the whole repo).
+        default_branch = (
+            run(
+                ["gh", "api", f"repos/{slug}", "--jq", ".default_branch"],
+                cwd=repo_root,
+                check=False,
+            )
+            .stdout.decode()
+            .strip()
+        )
+        base_r = run(
+            ["gh", "api", f"repos/{slug}/git/refs/heads/{default_branch}", "--jq", ".object.sha"],
+            cwd=repo_root,
+            check=False,
+        )
+        base_sha = base_r.stdout.decode().strip() if base_r.returncode == 0 else ""
+        if base_sha and object_exists_locally(base_sha, repo_root):
+            print(
+                f"  New branch — diffing against default branch '{default_branch}' ({base_sha[:7]})"
+            )
+            return slug, branch, base_sha, True  # branch_exists_on_remote=False
+        # Default branch SHA not available locally (never fetched) — full upload.
+        print(f"  New branch on existing repo — full upload (base not in local objects)")
+        return slug, branch, "", True  # empty base → full upload, but skip bootstrap
+
+    # Truly empty repo — needs bootstrap.
     print(f"  No remote branch found — will create {branch} from scratch")
-    return slug, branch, None
+    return slug, branch, None, False
 
 
 def gh_api(repo_slug, path, method="GET", data=None, cwd=Path("."), retries=3):
@@ -153,7 +195,9 @@ def initialize_empty_repo(repo_slug: str, branch: str, repo_root: Path) -> str:
     """
     print("  Empty repo — bootstrapping via Contents API...")
     resp = gh_api(
-        repo_slug, "contents/.gitkeep", method="PUT",
+        repo_slug,
+        "contents/.gitkeep",
+        method="PUT",
         data={"message": "chore: Initialize repository", "content": "", "branch": branch},
         cwd=repo_root,
     )
@@ -205,15 +249,17 @@ def main():
     )
 
     print("── GitHub Git Data API push ──")
-    repo_slug, branch, remote_sha = detect_context(repo_root)
+    repo_slug, branch, remote_sha, is_new_branch = detect_context(repo_root)
     local_sha = git_str("rev-parse", "HEAD", cwd=repo_root)
 
     print(f"Repo:   {repo_slug}")
     print(f"Branch: {branch}")
-    print(f"From:   {remote_sha[:7] if remote_sha else '(none — new repo)'} (remote)")
+    print(f"From:   {remote_sha[:7] if remote_sha else '(none — new repo/branch)'} (remote)")
     print(f"To:     {local_sha[:7]} (local HEAD)")
     if force:
         print("Mode:   FORCE PUSH (will overwrite remote history)")
+    if is_new_branch:
+        print(f"Mode:   NEW BRANCH (will create refs/heads/{branch})")
 
     if remote_sha and remote_sha == local_sha:
         print("\nNothing to push — remote is already up to date.")
@@ -222,10 +268,13 @@ def main():
     # Decide between diff mode and full-upload mode.
     #
     # Full-upload is required when:
-    #   (a) remote_sha is None  → brand-new repo, nothing on remote
-    #   (b) remote_sha is not in local objects → e.g. auto-init commit that
-    #       was never fetched; git diff would return empty, causing 422
-    full_upload = remote_sha is None or not object_exists_locally(remote_sha, repo_root)
+    #   (a) remote_sha is None  → brand-new empty repo, nothing on remote
+    #   (b) remote_sha is ""    → new branch, base commit not in local objects
+    #   (c) remote_sha is set but not in local objects → e.g. auto-init commit
+    #       that was never fetched; git diff would return empty, causing 422
+    full_upload = (
+        remote_sha is None or remote_sha == "" or not object_exists_locally(remote_sha, repo_root)
+    )
 
     if full_upload and remote_sha:
         print(f"  Remote SHA {remote_sha[:7]} not in local objects — switching to full-upload mode")
@@ -276,12 +325,16 @@ def main():
     # ── Bootstrap empty repo if needed ───────────────────────────────────────
     # The Git Data API returns 409 on repos that have never had a commit.
     # Use the Contents API to create a placeholder bootstrap commit first.
+    # ONLY for truly empty repos (remote_sha is None). A new branch on an
+    # existing repo (remote_sha == "" or a base SHA) must NOT bootstrap — the
+    # repo already has commits and the Contents API write may be forbidden.
+    bootstrapped = False
     if full_upload and remote_sha is None:
         remote_sha = initialize_empty_repo(repo_slug, branch, repo_root)
+        bootstrapped = True
         # remote_sha is now set but NOT in local objects →
         #   full_upload stays True (already set above)
         #   commit will have remote_sha as its parent (see commit_data below)
-        #   branch ref will be PATCHed (not POSTed) since remote_sha is not None
 
     # ── Create blobs ─────────────────────────────────────────────────────────
 
@@ -304,20 +357,36 @@ def main():
 
     # ── Create tree ───────────────────────────────────────────────────────────
 
-    print(f"\nCreating tree ({len(tree_items)} items)...")
-    tree_data: dict = {"tree": tree_items}
-    if base_tree_sha:
-        tree_data["base_tree"] = base_tree_sha
-    tree_resp = gh_api(repo_slug, "git/trees", method="POST", data=tree_data, cwd=repo_root)
-    print(f"  New tree: {tree_resp['sha'][:7]}")
+    # Edge case: no file changes (e.g. empty / version-bump / merge commit).
+    # The Git Data API rejects a tree with zero items and no base_tree (422),
+    # and a no-op diff yields an empty tree_items list. Reuse the base tree
+    # directly — the new commit points at the identical tree.
+    if not tree_items and base_tree_sha:
+        print(f"\nNo file changes — reusing base tree {base_tree_sha[:7]}")
+        tree_sha = base_tree_sha
+    else:
+        print(f"\nCreating tree ({len(tree_items)} items)...")
+        tree_data: dict = {"tree": tree_items}
+        if base_tree_sha:
+            tree_data["base_tree"] = base_tree_sha
+        tree_resp = gh_api(repo_slug, "git/trees", method="POST", data=tree_data, cwd=repo_root)
+        tree_sha = tree_resp["sha"]
+        print(f"  New tree: {tree_sha[:7]}")
 
     # ── Create commit ─────────────────────────────────────────────────────────
 
     commit_msg = git_str("log", "-1", "--format=%B", cwd=repo_root)
-    commit_data: dict = {"message": commit_msg, "tree": tree_resp["sha"]}
-    if remote_sha:
+    commit_data: dict = {"message": commit_msg, "tree": tree_sha}
+    if bootstrapped:
+        # Empty repo bootstrap: parent is the placeholder commit.
         commit_data["parents"] = [remote_sha]
-    # else: root commit — no parents (valid for a truly empty new repo)
+    elif is_new_branch and remote_sha:
+        # New branch diffed against a base commit: parent is that base.
+        commit_data["parents"] = [remote_sha]
+    elif remote_sha:
+        # Existing branch: parent is the current remote tip.
+        commit_data["parents"] = [remote_sha]
+    # else: new branch full-upload (remote_sha == "") → root commit, no parents.
 
     print("Creating commit...")
     new_commit = gh_api(repo_slug, "git/commits", method="POST", data=commit_data, cwd=repo_root)
@@ -326,25 +395,39 @@ def main():
     # ── Update (or create) branch ref ────────────────────────────────────────
 
     print("Updating branch ref...")
-    if remote_sha is None:
+    if is_new_branch:
+        # Branch doesn't exist on the remote yet — create the ref via POST.
         gh_api(
-            repo_slug, "git/refs", method="POST",
+            repo_slug,
+            "git/refs",
+            method="POST",
             data={"ref": f"refs/heads/{branch}", "sha": new_commit["sha"]},
             cwd=repo_root,
         )
     else:
         # Try PATCH first; fall back to POST if the ref doesn't exist on GitHub
         # (can happen when local tracking config exists but branch was never pushed)
-        cmd = ["gh", "api", f"repos/{repo_slug}/git/refs/heads/{branch}",
-               "-X", "PATCH", "--input", "-"]
+        cmd = [
+            "gh",
+            "api",
+            f"repos/{repo_slug}/git/refs/heads/{branch}",
+            "-X",
+            "PATCH",
+            "--input",
+            "-",
+        ]
         patch_r = subprocess.run(
-            cmd, input=json.dumps({"sha": new_commit["sha"], "force": True}).encode(),
-            capture_output=True, cwd=str(repo_root),
+            cmd,
+            input=json.dumps({"sha": new_commit["sha"], "force": True}).encode(),
+            capture_output=True,
+            cwd=str(repo_root),
         )
         if patch_r.returncode != 0 and "Reference does not exist" in patch_r.stderr.decode():
             print("  Branch ref missing on remote — creating via POST...")
             gh_api(
-                repo_slug, "git/refs", method="POST",
+                repo_slug,
+                "git/refs",
+                method="POST",
                 data={"ref": f"refs/heads/{branch}", "sha": new_commit["sha"]},
                 cwd=repo_root,
             )
@@ -386,13 +469,24 @@ def auto_sync(repo_slug: str, branch: str, new_sha: str, repo_root: Path):
 
     # 2. Set tracking config so 'git status' knows the upstream
     run(["git", "config", f"branch.{branch}.remote", "origin"], cwd=repo_root, check=False)
-    run(["git", "config", f"branch.{branch}.merge", f"refs/heads/{branch}"], cwd=repo_root, check=False)
+    run(
+        ["git", "config", f"branch.{branch}.merge", f"refs/heads/{branch}"],
+        cwd=repo_root,
+        check=False,
+    )
 
     # 3. Fetch new commit object via HTTPS (bypasses SSH / Zscaler)
     fetch_r = run(
-        ["git", "-c", "credential.helper=!gh auth git-credential",
-         "fetch", "origin", f"refs/heads/{branch}:refs/remotes/origin/{branch}"],
-        cwd=repo_root, check=False,
+        [
+            "git",
+            "-c",
+            "credential.helper=!gh auth git-credential",
+            "fetch",
+            "origin",
+            f"refs/heads/{branch}:refs/remotes/origin/{branch}",
+        ],
+        cwd=repo_root,
+        check=False,
     )
     if fetch_r.returncode != 0:
         print(f"  ⚠ Auto-sync fetch failed — run manually:")
@@ -401,8 +495,9 @@ def auto_sync(repo_slug: str, branch: str, new_sha: str, repo_root: Path):
         return
 
     # 4. Reset local HEAD to the fetched remote SHA
-    reset_r = run(["git", "reset", "--hard", f"refs/remotes/origin/{branch}"],
-                  cwd=repo_root, check=False)
+    reset_r = run(
+        ["git", "reset", "--hard", f"refs/remotes/origin/{branch}"], cwd=repo_root, check=False
+    )
     synced = git_str("rev-parse", "HEAD", cwd=repo_root)
     if reset_r.returncode == 0:
         print(f"  ✅ Local HEAD → {synced[:7]}  (matches remote)")
@@ -414,4 +509,3 @@ def auto_sync(repo_slug: str, branch: str, new_sha: str, repo_root: Path):
 
 if __name__ == "__main__":
     main()
-
