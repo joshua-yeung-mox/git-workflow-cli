@@ -40,6 +40,7 @@ How it works:
 """
 
 import base64
+import datetime
 import json
 import subprocess
 import sys
@@ -63,6 +64,101 @@ def git_str(*args, cwd):
 def object_exists_locally(sha: str, repo_root: Path) -> bool:
     """Return True if the git object exists in the local object store."""
     return run(["git", "cat-file", "-e", sha], cwd=repo_root, check=False).returncode == 0
+
+
+# ── Commit signing (org rulesets can require signed commits) ─────────────────
+#
+# GitHub's "force_signed_commit_signature" style rulesets reject ref updates
+# pointing at unsigned commits (422 "Reference update failed"). Commits created
+# via POST /git/commits are unsigned unless a `signature` field is supplied.
+# The Git Data API accepts SSH signatures over GitHub's canonical payload:
+#
+#   tree <sha>\n
+#   parent <sha>\n          (once per parent)
+#   author <name> <email> <unix_ts> <tz>\n
+#   committer <name> <email> <unix_ts> <tz>\n
+#   \n
+#   <message>
+#
+# Author/committer identity and timestamps MUST come from the local commit so
+# GitHub's payload reconstruction matches the signed bytes byte-for-byte.
+
+
+def build_canonical_payload(
+    *,
+    tree: str,
+    parents: list[str],
+    message: str,
+    author: tuple[str, str, int, str],
+    committer: tuple[str, str, int, str],
+) -> str:
+    """Build the exact bytes GitHub verifies a commit signature against.
+
+    author/committer are (name, email, unix_ts, tz) tuples, tz like "+0800".
+    """
+    lines = [f"tree {tree}"]
+    lines += [f"parent {p}" for p in parents]
+    a_name, a_email, a_ts, a_tz = author
+    c_name, c_email, c_ts, c_tz = committer
+    lines.append(f"author {a_name} <{a_email}> {a_ts} {a_tz}")
+    lines.append(f"committer {c_name} <{c_email}> {c_ts} {c_tz}")
+    return "\n".join(lines) + "\n\n" + message
+
+
+def iso_to_unix_tz(iso: str) -> tuple[int, str]:
+    """Convert an ISO-8601 git timestamp (%aI/%cI) to (unix_ts, ±HHMM)."""
+    dt = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    ts = int(dt.timestamp())
+    offset = dt.utcoffset() or datetime.timedelta(0)
+    total_minutes = int(offset.total_seconds() // 60)
+    sign = "+" if total_minutes >= 0 else "-"
+    total_minutes = abs(total_minutes)
+    tz = f"{sign}{total_minutes // 60:02d}{total_minutes % 60:02d}"
+    return ts, tz
+
+
+def resolve_signing_key(repo_root: Path) -> str | None:
+    """Return the SSH private key path git would sign with, or None.
+
+    Only supports gpg.format=ssh with an explicit user.signingkey (the
+    common setup). Key paths ending in .pub are stripped — git signs with
+    the private half. Falls back to the user's global git config.
+    """
+    key = (
+        run(["git", "config", "--get", "user.signingkey"], cwd=repo_root, check=False)
+        .stdout.decode()
+        .strip()
+    )
+    if not key:
+        return None
+    fmt = (
+        run(["git", "config", "--get", "gpg.format"], cwd=repo_root, check=False)
+        .stdout.decode()
+        .strip()
+    )
+    if fmt and fmt != "ssh":
+        return None  # openpgp/x509 signing not supported here
+    if key.endswith(".pub"):
+        key = key[: -len(".pub")]
+    return key or None
+
+
+def ssh_sign(key_path: str, payload: bytes) -> str | None:
+    """Sign payload bytes with ssh-keygen (namespace git); None on failure."""
+    try:
+        r = subprocess.run(
+            ["ssh-keygen", "-Y", "sign", "-f", key_path, "-n", "git"],
+            input=payload,
+            capture_output=True,
+        )
+    except FileNotFoundError:
+        return None
+    if r.returncode != 0:
+        return None
+    sig = r.stdout.decode()
+    if "BEGIN SSH SIGNATURE" not in sig:
+        return None
+    return sig
 
 
 def detect_context(repo_root: Path):
@@ -376,6 +472,10 @@ def main():
     # ── Create commit ─────────────────────────────────────────────────────────
 
     commit_msg = git_str("log", "-1", "--format=%B", cwd=repo_root)
+    # Exact stored message bytes (git_str strips the trailing newline git
+    # keeps; the signature must cover the message byte-for-byte).
+    commit_msg_bytes = run(["git", "log", "-1", "--format=%B"], cwd=repo_root).stdout.decode()
+    commit_msg = commit_msg_bytes.rstrip("\n") + "\n" if commit_msg_bytes.strip() else ""
     commit_data: dict = {"message": commit_msg, "tree": tree_sha}
     if bootstrapped:
         # Empty repo bootstrap: parent is the placeholder commit.
@@ -387,6 +487,44 @@ def main():
         # Existing branch: parent is the current remote tip.
         commit_data["parents"] = [remote_sha]
     # else: new branch full-upload (remote_sha == "") → root commit, no parents.
+
+    # Sign the commit if the local repo uses SSH signing. Rulesets like
+    # force_signed_commit_signature reject unsigned API commits (422).
+    # Identity/timestamps are taken from the LOCAL commit so GitHub's
+    # payload reconstruction matches the signed bytes exactly.
+    signing_key = resolve_signing_key(repo_root)
+    if signing_key:
+        author_iso = git_str("log", "-1", "--format=%aI", cwd=repo_root)
+        committer_iso = git_str("log", "-1", "--format=%cI", cwd=repo_root)
+        author_name = git_str("log", "-1", "--format=%an", cwd=repo_root)
+        author_email = git_str("log", "-1", "--format=%ae", cwd=repo_root)
+        committer_name = git_str("log", "-1", "--format=%cn", cwd=repo_root)
+        committer_email = git_str("log", "-1", "--format=%ce", cwd=repo_root)
+        a_ts, a_tz = iso_to_unix_tz(author_iso)
+        c_ts, c_tz = iso_to_unix_tz(committer_iso)
+        payload = build_canonical_payload(
+            tree=tree_sha,
+            parents=commit_data.get("parents", []),
+            message=commit_msg,
+            author=(author_name, author_email, a_ts, a_tz),
+            committer=(committer_name, committer_email, c_ts, c_tz),
+        )
+        signature = ssh_sign(signing_key, payload.encode())
+        if signature:
+            commit_data["author"] = {
+                "name": author_name,
+                "email": author_email,
+                "date": author_iso,
+            }
+            commit_data["committer"] = {
+                "name": committer_name,
+                "email": committer_email,
+                "date": committer_iso,
+            }
+            commit_data["signature"] = signature
+            print("  🔏 Commit SSH-signed (ruleset-safe)")
+        else:
+            print("  ⚠ SSH signing failed — pushing unsigned (rulesets may reject)")
 
     print("Creating commit...")
     new_commit = gh_api(repo_slug, "git/commits", method="POST", data=commit_data, cwd=repo_root)
@@ -434,6 +572,13 @@ def main():
         elif patch_r.returncode != 0:
             print(f"ERROR: {' '.join(cmd)}", file=sys.stderr)
             print(patch_r.stderr.decode()[:500], file=sys.stderr)
+            if "422" in patch_r.stderr.decode():
+                print(
+                    "  Hint: HTTP 422 with a valid commit usually means a ruleset\n"
+                    "  (e.g. force_signed_commit_signature) rejected it. Signed\n"
+                    "  push requires gpg.format=ssh + user.signingkey in the repo.",
+                    file=sys.stderr,
+                )
             sys.exit(1)
     print(f"  ✅ {branch} → {new_commit['sha'][:7]}")
 
